@@ -80,6 +80,84 @@
 
 面试时可以强调：差异基因筛选和标准化是为了降低高维基因表达数据中的噪声和尺度差异。
 
+## 模型输入的变化过程
+
+这一节按“数据在代码里一步步变成什么”来理解。
+
+第一步：原始表达矩阵。
+
+```text
+X_raw: [样本数, 原始基因数]
+y:     [样本数]
+```
+
+每一行是一个病人样本，每一列是一个基因表达值。
+
+第二步：基因筛选。
+
+```text
+X_selected: [样本数, 筛选后基因数]
+```
+
+`selecter.py` 会先做低表达过滤、方差过滤和差异表达分析。筛选后基因数会减少，目的是降低噪声和过拟合风险。这里的“筛选后基因数”就是后面图里的节点数量。
+
+第三步：标准化。
+
+```text
+X_scaled: [样本数, 筛选后基因数]
+```
+
+`StandardScaler` 按列处理，也就是对每个基因分别做标准化。这样不同基因的表达值尺度更一致，避免某些数值范围大的基因主导训练。
+
+第四步：划分数据集。
+
+```text
+X_train: [训练样本数, 筛选后基因数]
+X_val:   [验证样本数, 筛选后基因数]
+X_test:  [测试样本数, 筛选后基因数]
+```
+
+第五步：构建共享基因图。
+
+```text
+edge_index: [2, 边数]
+```
+
+`edge_index` 描述“基因节点之间怎么连”。当前默认是 `full_connected`，也就是筛选后的所有基因两两可交互。
+
+第六步：把每个样本变成一张图。
+
+对于第 `i` 个样本：
+
+```text
+原始一行表达向量:       [筛选后基因数]
+转成节点特征矩阵 x:     [筛选后基因数, 1]
+共享边 edge_index:      [2, 边数]
+图标签 y_i:             [1]
+```
+
+也就是说，`create_data_objects` 会把表格中的每一行变成一个 PyG `Data`：
+
+```text
+Data(
+    x = 当前样本的基因表达,      shape = [G, 1]
+    edge_index = 共享基因图,     shape = [2, E]
+    y = 当前样本早/晚期标签
+)
+```
+
+第七步：DataLoader 组成 batch。
+
+如果 batch size 是 `B`，筛选后基因数是 `G`：
+
+```text
+batch.x:          [B * G, 1]
+batch.edge_index: 多张图合并后的边索引
+batch.batch:      [B * G]，标记每个节点属于哪张样本图
+```
+
+这就是 GeneGAT 真正收到的输入。
+
 ## 图是怎么建的
 
 这个项目的图不是“样本图”，而是“基因图”。
@@ -118,6 +196,31 @@
   对每个基因找表达模式最相近的 k 个基因。
 
 注意：`graph.py` 里构图只使用训练集信息，这是为了减少测试集信息泄漏。
+
+## 全连接图和注意力怎么理解
+
+当前默认图结构是 `full_connected`，也就是同一张样本图中每个基因都可以和所有其他基因交互。
+
+这和 Transformer 有相似之处：
+
+- Transformer 里每个 token 可以 attend 到其他 token。
+- 这里每个基因节点可以 attend 到其他基因节点。
+- 全连接边提供“可交互范围”，GAT attention 学习“实际更重视谁”。
+
+但它不是把所有病人样本混成一张大图。更准确的理解是：
+
+```text
+每个样本各自是一张基因图
+所有样本共用同一个基因拓扑 edge_index
+所有样本共用同一套 GAT 参数
+每个样本因为表达值不同，会产生不同的注意力响应和图嵌入
+```
+
+所以可以把它理解成一个“共享的基因注意力场”：
+
+- 共享的是基因位置、基因连接方式、GAT 参数。
+- 不共享的是每个病人的节点表达值。
+- 模型学习的是在这个共享基因空间里，哪些基因关系模式和早晚期分类有关。
 
 ## GeneGAT 模型细节
 
@@ -160,6 +263,77 @@
 面试可以这样说：
 
 “GAT 不是直接对表格做分类，而是先把每个样本转成基因图。模型通过注意力学习基因之间的关系，再通过软聚类池化得到样本级 embedding，最后用于分类和下游 XGBoost 融合。”
+
+## 图模型的架构设计方式
+
+GeneGAT 的设计可以按“节点表示学习、图级聚合、样本分类”三层理解。
+
+第一层：节点表示学习。
+
+```text
+输入节点特征 [G, 1]
+经过 Linear(1, 128)
+得到每个基因节点的隐藏表示 [G, 128]
+```
+
+为什么需要这一步：
+
+- 原始表达值只是一个标量，表达能力有限。
+- 投影到 128 维后，每个基因节点有更丰富的隐空间表示。
+- 这类似 NLP 里把 token 映射成 embedding，只不过这里 token 是基因，输入值是表达量。
+
+第二层：图注意力传播。
+
+```text
+GATConv 在 edge_index 定义的边上做信息传递
+每个基因聚合邻居基因信息
+注意力权重决定不同邻居的重要性
+```
+
+在全连接图下，这一步可以理解为“每个基因都可以看所有其他基因，但模型自己学哪些关系更重要”。这也是它和普通全连接 MLP 的区别：MLP 直接混合特征，GAT 则显式以“节点和边”的形式做关系建模。
+
+第三层：残差和归一化。
+
+```text
+输入投影后使用 LayerNorm
+GAT 层之间使用 residual connection
+每层后使用 activation 和 dropout
+```
+
+这些设计主要是为了稳定训练。小样本基因任务很容易过拟合，所以 `dropout=0.5` 比较大。
+
+第四层：软聚类池化。
+
+```text
+cluster_assignment: [G, 128] -> [G, 8]
+```
+
+它不是简单把所有基因平均，而是学习每个基因属于 8 个 cluster 的概率。可以把 cluster 理解成模型自动学出的“基因功能组合”或“表达模式组”。
+
+对每张图：
+
+```text
+graph_clusters = assignment.T @ node_features
+shape: [8, 128]
+```
+
+第五层：图级表示。
+
+```text
+max_pool(graph_clusters): [128]
+min_pool(graph_clusters): [128]
+concat:                   [256]
+dim_reduction:             [8]
+```
+
+最后这个 8 维向量就是样本级 graph embedding。它既用于 GAT 自己分类，也会作为 `graph` 特征输入 XGBoost。
+
+第六层：分类输出。
+
+```text
+classifier: Linear(8, 2) + Dropout
+输出: [早期logit, 晚期logit]
+```
 
 ## GeneGAT 维度流转
 
@@ -260,6 +434,46 @@ max/min pooling：
 - F1
 - AUC
 
+## 具体处理操作流程
+
+这里按 `src/pipline/runner.py` 的真实执行顺序看。
+
+1. 创建输出目录
+   `models/experiment` 保存模型，`results/experiment` 保存指标，`images/experiment` 保存 SHAP 图。
+
+2. 读取和准备数据
+   调用 `prepare_data`，得到 `X_train`、`X_val`、`X_test`、标签和基因名。
+
+3. 构建基因图
+   调用 `create_graph(X_train, method=args.graph_method)`，只用训练集估计图结构，避免测试集泄漏。
+
+4. 创建 PyG DataLoader
+   train、val、test 都复用同一个 `edge_index`，但是每个 split 里的样本表达值不同。
+
+5. 创建 GeneGAT
+   `build_model` 使用命令行参数创建模型，默认是 2 层 GAT、hidden 128、8 个 attention heads。
+
+6. 训练或加载 GAT
+   如果指定 `--load_model`，直接加载；否则训练并保存 `model_fold_0.pt`。
+
+7. 测试 GAT
+   调用 `predict_with_loader`，输出 GAT 自身的 Accuracy、F1、AUC。
+
+8. 提取图嵌入
+   调用 `extract_pooling_features`，得到 train、val、test 的 graph embedding。
+
+9. 构造三组 XGBoost 特征
+   `raw` 是原始表达矩阵，`graph` 是 GAT 嵌入，`hybrid` 是二者拼接。
+
+10. 训练三组 XGBoost
+    分别训练 raw-XGBoost、graph-XGBoost、hybrid-XGBoost，用同一套默认参数做公平对比。
+
+11. 可选 SHAP
+    如果不加 `--skip_shap`，对 hybrid XGBoost 做 SHAP，保存重要特征图和表格。
+
+12. 保存汇总结果
+    写出 `metrics_summary.csv` 和 `metrics_summary.md`。
+
 ## 为什么还接 XGBoost
 
 GAT 训练完以后，会提取每个样本的图嵌入。然后比较三组特征：
@@ -310,6 +524,51 @@ XGBoost 默认参数在 `src/pipline/xgboost.py` 的 `DEFAULT_XGB_PARAMS`：
 | `knn` | `k=15` | 每个基因连接表达模式最接近的 15 个基因 |
 
 当前 `main.py` 默认使用 `full_connected`。面试时可以说：默认全连接是为了让 GAT 自己通过注意力学习边的重要性；后续可以比较 correlation 和 knn 来验证图先验是否带来提升。
+
+## 后续实验流程安排
+
+如果继续做实验，可以按下面顺序推进。
+
+第一组：确认主结果。
+
+- 固定 `graph_method=full_connected`
+- 跑 `raw`、`graph`、`hybrid`
+- 记录 GAT、raw-XGBoost、graph-XGBoost、hybrid-XGBoost 的 Accuracy、F1、AUC
+
+目的：确认 hybrid 是否优于 raw，以及 graph embedding 是否提供额外信息。
+
+第二组：比较图结构。
+
+- 跑 `full_connected`
+- 跑 `correlation`
+- 跑 `knn`
+
+目的：回答“全连接是否必要，基于相关性或 KNN 的基因先验是否更好”。
+
+第三组：模型参数消融。
+
+- `hidden_dim`: 32、64、128
+- `pooling_dim`: 8、16、32
+- `gat_layers`: 1、2、3
+- `dropout`: 0.3、0.5、0.7
+
+目的：看当前 1 维到 128 维是否过强，模型是否过拟合。
+
+第四组：训练稳定性实验。
+
+- 多随机种子重复
+- K 折平均
+- 记录均值和标准差
+
+目的：减少单次划分偶然性，让结果更可靠。
+
+第五组：解释性分析。
+
+- 只对表现最好的 hybrid 模型做 SHAP
+- 分别看原始基因特征和 `Emb_i` 图嵌入特征
+- 汇总稳定出现的重要基因
+
+目的：把模型结果转成可解释的候选生物标志物和关系模式。
 
 ## SHAP 怎么解释
 
